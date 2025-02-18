@@ -11,18 +11,20 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
 import tempfile
 import os
+import numpy as np
 
 class LLMWorker(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
 
-    def __init__(self, question, model_name, temperature, csv_context=None):
+    def __init__(self, question, model_name, temperature, csv_context=None, full_data_context=None):
         super().__init__()
         self.question = question
         self.model_name = model_name
         self.temperature = temperature
         self.csv_context = csv_context
+        self.full_data_context = full_data_context
 
     def run(self):
         try:
@@ -30,23 +32,26 @@ class LLMWorker(QThread):
             llm = OllamaLLM(
                 model=self.model_name,
                 temperature=self.temperature
-            )
-            
-            # If we have CSV context, include it in the prompt
+            )    
             if self.csv_context:
-                template = """CSV Data Context:
+                template = """CSV Data Overview:
 {csv_context}
+
+Full Data Analysis:
+{full_data_context}
 
 Question about the data: {question}
 
-Provide a clear and detailed answer based on the CSV data above:"""
+Provide a clear and detailed answer based on the complete CSV data above. Include relevant statistics and patterns from the full dataset in your response:"""
+                
                 prompt = PromptTemplate(
-                    input_variables=["csv_context", "question"],
+                    input_variables=["csv_context", "full_data_context", "question"],
                     template=template
                 )
                 chain = LLMChain(llm=llm, prompt=prompt, verbose=True)
                 response = chain.invoke({
                     "csv_context": self.csv_context,
+                    "full_data_context": self.full_data_context,
                     "question": self.question
                 })
             else:
@@ -302,6 +307,52 @@ class LLMInterface(QMainWindow):
         except Exception as e:
             self.status_label.setText(f"Error creating plot: {str(e)}")
 
+    def generate_data_context(self, df):
+        """Generate comprehensive context about the dataset"""
+        context = []
+        
+        # Value distributions for each column
+        for column in df.columns:
+            if pd.api.types.is_numeric_dtype(df[column]):
+                # For numeric columns
+                quartiles = df[column].quantile([0.25, 0.5, 0.75])
+                context.append(f"\nColumn '{column}' analysis:")
+                context.append(f"- Range: {df[column].min():.2f} to {df[column].max():.2f}")
+                context.append(f"- Quartiles: 25%={quartiles[0.25]:.2f}, 50%={quartiles[0.5]:.2f}, 75%={quartiles[0.75]:.2f}")
+                context.append(f"- Mean: {df[column].mean():.2f}")
+                context.append(f"- Standard deviation: {df[column].std():.2f}")
+            else:
+                # For categorical columns
+                value_counts = df[column].value_counts()
+                unique_count = len(value_counts)
+                if unique_count <= 10:  # Only show distribution if there aren't too many unique values
+                    context.append(f"\nColumn '{column}' distribution:")
+                    for value, count in value_counts.items():
+                        context.append(f"- {value}: {count} occurrences ({(count/len(df)*100):.1f}%)")
+                else:
+                    context.append(f"\nColumn '{column}' has {unique_count} unique values")
+        
+        # Correlations for numeric columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 1:
+            context.append("\nCorrelations between numeric columns:")
+            corr_matrix = df[numeric_cols].corr()
+            for i in range(len(numeric_cols)):
+                for j in range(i+1, len(numeric_cols)):
+                    col1, col2 = numeric_cols[i], numeric_cols[j]
+                    corr = corr_matrix.loc[col1, col2]
+                    if abs(corr) > 0.3:  # Only show meaningful correlations
+                        context.append(f"- {col1} vs {col2}: {corr:.2f}")
+        
+        # Missing values
+        missing = df.isnull().sum()
+        if missing.any():
+            context.append("\nMissing values:")
+            for column, count in missing[missing > 0].items():
+                context.append(f"- {column}: {count} missing values ({(count/len(df)*100):.1f}%)")
+        
+        return "\n".join(context)
+
     def process_question(self):
         question = self.input_area.toPlainText().strip()
         if not question:
@@ -317,6 +368,7 @@ class LLMInterface(QMainWindow):
         
         # Prepare CSV context if available
         csv_context = None
+        full_data_context = None
         if self.df is not None:
             csv_context = f"""The CSV file has {self.df.shape[0]} rows and {self.df.shape[1]} columns.
 Column names: {', '.join(self.df.columns)}
@@ -326,13 +378,17 @@ First few rows of the data:
 
 Summary statistics:
 {self.df.describe().to_string()}"""
+
+            # Generate comprehensive data context
+            full_data_context = self.generate_data_context(self.df)
         
         # Create and start worker thread
         self.worker = LLMWorker(
             question,
             self.model_selector.currentText(),
             float(self.temp_selector.currentText()),
-            csv_context
+            csv_context,
+            full_data_context
         )
         self.worker.finished.connect(self.handle_response)
         self.worker.error.connect(self.handle_error)
